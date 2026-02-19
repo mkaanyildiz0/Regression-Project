@@ -1,0 +1,595 @@
+---
+title: "R Regresyon Final"
+author: "Kaan, Sadık, Alihan"
+date: "2026-01-27"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(mice)
+library(lmtest)
+library(caret)
+library(car)
+library(nortest)
+library(ggplot2)
+library(patchwork)
+library(PerformanceAnalytics)
+```
+
+# BMW İkinci El Otomobil Değer Analizi {.tabset .tabset-fade}
+
+Bu çalışma kapsamında, Türkiye ikinci el otomobil piyasasındaki **BMW** marka araçların fiyatlandırma dinamiklerini anlamak amacıyla oluşturulmuş **10.000** gözlemlik sentetik bir veri seti incelenmiştir. Veri seti; araçların teknik konfigürasyonlarını, kullanım geçmişlerini ve detaylı ekspertiz (hasar) kayıtlarını içermektedir.
+
+## Veri Sözlüğü
+
+Aşağıdaki tablo, analizde kullanılan değişkenlerin teknik detaylarını ve açıklamalarını içermektedir:
+
+### 1. Teknik ve Kimlik Bilgileri
+
+| Değişken | Tanım | Birim / Format |
+|------------------------|------------------------|------------------------|
+| **series** | Aracın Model Serisi | Factor (1 Serisi, 3 Serisi, X Serisi...) |
+| **segment** | Aracın Pazar Segmenti | Factor (C, D, E...) |
+| **horsepower** | Motorun Ürettiği Güç | Beygir Gücü (HP) |
+| **curb_weight** | Aracın Boş Ağırlığı | Kilogram (kg) |
+| **top_speed** | Maksimum Sürat | km/saat |
+
+### 2. Kullanım Geçmişi
+
+| Değişken       | Tanım                           | Birim / Format |
+|----------------|---------------------------------|----------------|
+| **model_year** | Aracın Üretim Yılı              | Yıl (YYYY)     |
+| **mileage**    | Aracın Toplam Kat Ettiği Mesafe | Kilometre (km) |
+
+### 3. Ekspertiz ve Hasar Kayıtları
+
+| Değişken | Tanım | Birim / Format |
+|------------------------|------------------------|------------------------|
+| **roof_replaced** | Tavan Değişim Durumu | Binary (1: Evet, 0: Hayır) |
+| **roof_painted** | Tavan Tam Boya Durumu | Binary (1: Evet, 0: Hayır) |
+| **hood_replaced** | Kaput Değişim Durumu | Binary (1: Evet, 0: Hayır) |
+| **trunk_replaced** | Bagaj Kapağı Değişim Durumu | Binary (1: Evet, 0: Hayır) |
+| **door\_...\_count** | Kapılardaki Değişen/Boyalı Adedi | Tam Sayı (Numeric) |
+| **fender\_...\_count** | Çamurluklardaki Değişen/Boyalı Adedi | Tam Sayı (Numeric) |
+| **bumper_process** | Tamponda Yapılan İşlem Sayısı | Tam Sayı (Numeric) |
+| **is_heavy_damaged** | Ağır Hasar (Pert) Kaydı Durumu | Factor (1: Evet, 0: Hayır) |
+
+### 4. Hedef Değişken
+
+| Değişken  | Tanım                      | Birim / Format  |
+|-----------|----------------------------|-----------------|
+| **price** | Aracın Piyasa Satış Fiyatı | Türk Lirası (TL) |
+
+------------------------------------------------------------------------
+
+## Analitik Yaklaşım
+
+Veri seti üzerinde gerçekleştirilecek analizler şu temel direklere dayanmaktadır:
+
+-   **Veri Ön İşleme:** Eksik verilerin (Missing Values) seriye özel **Mod** ve **MICE** algoritmaları ile doldurulması.
+-   **Özellik Mühendisliği (Feature Engineering):** Parça bazlı hasarların kümülatif bir **Hasar Skoru** (Damage Score) altında birleştirilmesi.
+-   **Tahminleme:** Araç fiyatı üzerindeki doğrusal olmayan (non-linear) etkilerin logaritmik regresyon modelleri ile incelenmesi.
+
+```{r cars}
+bmw_cars <- read.csv("bmw_data.csv")
+```
+
+## Değişen / Boyanmış / Local Boyanmış Parçalar için Hasar Skoru (Boyut İndirgeme)
+
+### 1. Parçaların Önem Sırası (Hierarchy)
+
+Her parça araç değerini aynı oranda düşürmez. **Skor yaklaşımı**, modele "Tavan değişiminin (puan) bir kapı boyasından (puan) çok daha kritik" olduğunu öğretmemizi sağlar.
+
+### 2. Veri Yoğunluğunu Artırmak (Denser Signal)
+
+16 farklı kolonda tek tük bulunan hasar kayıtları "dağınık" bir gürültü yaratır. Tüm bunları tek bir **`risk_score`** altında topladığımızda, modelin eline hasarın şiddetini gösteren çok daha net ve "anlamlı" bir veri vermiş oluruz.
+
+### 3. Yorumlama Kolaylığı (Interpretability)
+
+16 farklı değişkenin katsayısını tek tek açıklamak yerine, "Hasar skoru 1 birim arttığında fiyat %X düşüyor" diyerek çok daha profesyonel ve anlaşılır bir sonuç elde ederiz.
+
+------------------------------------------------------------------------
+
+| Özellik        | Neden Skor Yaklaşımı?                              |
+|----------------|----------------------------------------------------|
+| **Mantık**     | Tavan \> Kaput \> Kapı hiyerarşisini kurmak.       |
+| **İstatistik** | Dağınık veriyi tek bir güçlü sinyale dönüştürmek.  |
+| **Sonuç**      | Daha basit ve yorumlanabilir bir model elde etmek. |
+
+```{r}
+bmw_cars <- bmw_cars %>%
+  mutate(risk_score = 
+           (roof_replaced * 150) + (roof_painted * 75) + (roof_local_painted * 40) +
+           (hood_replaced * 60) + (hood_painted * 30) + (hood_local_painted * 15) +
+           (trunk_replaced * 40) + (trunk_painted * 20) + (trunk_local_painted * 10) +
+           (door_replaced_count * 10) + (door_painted_count * 5) 
+         + (door_local_painted_count * 2) + (fender_replaced_count * 8) + (fender_painted_count * 4) + (fender_local_painted_count * 2) +
+           (bumper_process_count * 1)
+  ) %>% select(-roof_replaced, -roof_painted, -roof_local_painted,
+               -hood_replaced, -hood_painted, -hood_local_painted,
+               -trunk_replaced, -trunk_painted, -trunk_local_painted,
+               -door_replaced_count, -door_painted_count, -door_local_painted_count,
+               -fender_replaced_count, -fender_painted_count, -fender_local_painted_count,
+               -bumper_process_count)
+```
+
+## Boş Gözlem Doldurma
+### 1. MICE paketi ile boş gözlemlere bakmak
+
+```{r, fig.width=20, fig.height=10}
+invisible(md.pattern(bmw_cars, 
+                     rotate.names = TRUE, 
+                     plot = TRUE))       
+```
+
+### 2. Seri Bazlı Segment Doldurma
+
+-   **Model Karakteristiğini Korumak:** BMW serileri (1, 3, 5, X Serisi vb.) arasında beygir gücü, ağırlık ve fiyat gibi değişkenler açısından belirgin hiyerarşik farklar bulunur.
+
+-   **Veri Yanlılığını (Bias) Önlemek:** \* **Genel Atama:** Tüm veri setinin medyanını kullanmak, 1 Serisi (küçük/hafif) ile X5 (büyük/ağır) araçları birbirine yaklaştırarak veriyi "ortalama bir modele" hapseder.
+
+-   **Seriye Özel Atama:** 5 Serisi'ndeki eksik bir teknik verinin, yine diğer 5 Serisi araçların ortalamasıyla doldurulması, aracın fabrikasyon kimliğine en yakın sonucun üretilmesini sağlar.
+
+------------------------------------------------------------------------
+
+```{r}
+bmw_cars <- bmw_cars %>%
+  mutate(segment = na_if(segment, "")) %>%
+  group_by(series) %>%
+  mutate(
+    segment = if_else(
+      is.na(segment),
+      {
+        seg <- segment[!is.na(segment)]
+        if (length(seg) == 0) NA_character_
+        else names(which.max(table(seg)))
+      },
+      segment
+    )
+  ) %>%
+  ungroup()
+```
+
+### 3. MICE ve `lm()` için değişkenleri faktöre çevirme
+
+```{r}
+bmw_cars$series <- as.factor(bmw_cars$series)
+bmw_cars$segment <- as.factor(bmw_cars$segment)
+bmw_cars$is_heavy_damaged <- as.factor(bmw_cars$is_heavy_damaged)
+```
+
+### 4. MICE ile Random Forest ile boş gözlem doldurma
+
+```{r,results = 'hide', warning=FALSE}
+set.seed(301)
+imputed = mice(bmw_cars, method = "rf", m = 3,printFlag = F)
+data_Imp = complete(imputed,1)
+```
+
+## Train-test ayrımı
+
+```{r}
+set.seed(301)
+sampleIndex <- sample(1:nrow(data_Imp),size = 0.8 * nrow(data_Imp))
+
+trainset <- data_Imp[sampleIndex,]
+testset <- data_Imp[-sampleIndex,]
+```
+
+## Korelasyon grafiğinin incelenmesi
+
+```{r, fig.width=20, fig.height=10, echo=FALSE, warning=FALSE}
+
+chart.Correlation(dplyr::select_if(trainset, is.numeric),,histogram = T,pch = 19)
+```
+
+## Modelin Kurulması
+### 1. Hiçbir işlem olmadan kurulan model
+
+```{r}
+model_without_log <- lm(price ~ .,data = trainset)
+summary(model_without_log)
+```
+
+```{r, fig.width=20, fig.height=10, echo=FALSE}
+par(mfrow = c(2, 2))
+plot(model_without_log)
+```
+Bu grafiklerden görüldüğü üzere özellikle 1. ve 3. grafiklerdeki artık dağılımlarında iyi bir grafik dağılımı yok. Hafif u şekli var bunun için log dönüşümü yapacağız. Zaten
+verimiz sağa çarpık. Aşağıdaki grafik bunu göstermektedir. Ayrıca modelde singülerlik var bunu aşmak için NA olan p-değerlerine sahip olan değişkenleri çıkartarak değişken sayısını (boyutu) azaltacağız. Varyans homojenliği yoktur.
+
+```{r, fig.width=20, fig.height=10, echo=FALSE}
+par(mfrow = c(1, 2))
+hist(data_Imp$price)
+hist(log(data_Imp$price))
+```
+
+```{r}
+bptest(model_without_log)
+dwtest(model_without_log)
+```
+```{r}
+res = residuals(model_without_log)
+n <- length(res)
+plot(tail(res,n-1) ~ head(res,n-1),xlab = expression(hat(epsilon)[i]),
+     ylab = expression(hat(epsilon)[i + 1]))
+abline(h = 0, v= 0,col=grey(0.75))
+```
+
+```{r}
+cor(tail(res,n-1) , head(res,n-1))
+```
+
+```{r}
+lillie.test(res)
+cvm.test(res)
+test_res <- logical(1000)
+for(i in 1:1000) {
+  res_sample <- sample(res,50)
+  test_res[i] <- shapiro.test(res_sample)$p > 0.05
+}
+table(test_res)
+```
+
+Testlere bakıldığı üzere Durbin-Watson harici hiçbir varsayım sağlanmamaktadır. Şuan için tüm değişkenlerle modeli tekrardan bağımlı değişkeni `log()` dönüşümü ile kuracağız. Durbin-Watson değeri 1.5 - 2.5 arasında ve sağlanır.
+Yani grafikteki varyans homojenliği olmamasını Breusch-Pagan test ile doğruluyoruz. Ayrıca artıklar da QQ-Plot ve testlerde görüldüğü üzere normal dağılmıyor. Grafikte görüldüğü üzere de artıkların arasında korelasyon yoktur.
+
+`alias()` ile mükemmel bağımlılıkları görebiliyoruz. Segment ile seriler arasında var. Zaten seriler genelde belirli segment olduğundan bu beklenen bir durumdur.
+
+```{r}
+alias(model_without_log)
+```
+
+
+### 2. Log dönüşümü ve Segment Çıkartılmış
+Log dönüşümü uygulandı ve segment `NA` olan anlamsız değişken çıkartıldı ve model singülerlikten kurtarıldı. Artık VIF değerlerine de bakılabilir. Ama önce amacımız modeldeki
+anlamsız p değerine sahip olan değişkenleri çıkarmaktır ve performansına bakmaktır.
+
+
+```{r}
+modelbase <- lm(log(price) ~ . -segment,data = trainset)
+summary(modelbase)
+```
+
+Varsayım grafiklerimiz şuan gayet stabiller. 
+
+```{r, fig.width=20, fig.height=10, echo=FALSE}
+par(mfrow = c(2, 2))
+plot(modelbase)
+```
+Modeli tüm anlamsızlardan arındırarak asıl modelimizi kuruyoruz.
+
+```{r}
+model2 <- lm(log(price) ~ series + model_year + mileage + 
+                  horsepower + risk_score, 
+                data = trainset)
+
+summary(model2)
+```
+```{r}
+bptest(model2)
+dwtest(model2)
+```
+
+```{r}
+res = residuals(model2)
+n <- length(res)
+plot(tail(res,n-1) ~ head(res,n-1),xlab = expression(hat(epsilon)[i]),
+     ylab = expression(hat(epsilon)[i + 1]))
+abline(h = 0, v= 0,col=grey(0.75))
+```
+
+```{r}
+cor(tail(res,n-1) , head(res,n-1))
+```
+
+```{r}
+lillie.test(res)
+cvm.test(res)
+test_res <- logical(1000)
+for(i in 1:1000) {
+  res_sample <- sample(res,50)
+  test_res[i] <- shapiro.test(res_sample)$p > 0.05
+}
+table(test_res)
+```
+
+
+Multicollinerity (collinerity) varsayımı için car paketinden `vif()`  fonksiyonu ile Generalized Variance Inflation Factore baktık.Bunun sebebi değişkenlerde kategorik değişkenlerin olmasıdır. Serbestlik derecesine göre hesap yeniden yapılır ve görüldüğü üzere herhangi bir VIF problemi yoktur.
+$$GVIF_j = \frac{\det(R_j) \cdot \det(R_{-j})}{\det(R)}$$
+
+```{r}
+vif(model2)
+```
+
+```{r}
+predictionModel2 = predict(model2,testset)
+predictionModel2 = exp(predictionModel2)
+
+results_df <- data.frame(
+  Model = c("predictionModel2"),
+  R2    = c(
+    R2(predictionModel2, testset$price)
+  ),
+  MAE   = c(
+    MAE(predictionModel2, testset$price)
+  ),
+  RMSE  = c(
+    RMSE(predictionModel2, testset$price)
+  ),
+  MAPE  = c(
+    mean(abs((testset$price - predictionModel2) / testset$price)) * 100
+  )
+)
+results_df
+```
+```{r,echo=FALSE}
+plot(testset$price,predictionModel2)
+```
+
+Modelin tüm testleri ve grafikleri güzel geldi. Yukarıda görüldüğü üzere gerçek tahmini değerler saçılım grafiği de gayet güzel. Ayıca varyanslar homojen residual normal
+dağılıyor.
+Plot yorumu: Component + residual plotlar, model year değişkeni için doğrusal varsayımın oldukça iyi sağlandığını; mileage, horsepower ve risk_score değişkenlerinde ise hafif doğrusal olmayan yapılar bulunduğunu gösteriyor.
+
+### 3. Modelden artık ve Cooks Distance yöntemleriyle artıkları ayırma
+Buradaki amaç artıkları standartlaştırıp 2 alt ve üst standart sapmasını kaplayan alanın dışındaki değerleri almak ve cooks distance ile modeldeki aykırıları almak.
+Büyük olan ölçüt ve standartlaştırılmış aykırıların 2 standart sapma dışında kalanların ortak indekslerini alıp veriden dışarı atıyoruz.
+
+```{r}
+## model resiudallerinden outlier çıkarma
+standardized_residuals = rstandard(model2)
+summary(standardized_residuals)
+
+olcut1Index = which(abs(standardized_residuals)>2)
+length(olcut1Index) 
+
+dist = cooks.distance(model2)
+olcut1 = mean(dist)*3
+
+olcut2 = 4/length(dist)
+
+
+olcut1;olcut2
+
+olcut1Index = which(dist>olcut1)
+olcut2Index = which(dist>olcut2)
+length(olcut1Index);length(olcut2Index)
+
+
+plot(1:length(dist),dist,type = "p", ylim = range(dist)*c(1,0.07))
+abline(h = olcut1, col = "red")
+abline(h = olcut2, col = "green")
+```
+
+```{r}
+outliers = which(dist>olcut2 & abs(standardized_residuals)>2)
+
+trainsetrem = trainset[-outliers,]
+nrow(trainset);nrow(trainsetrem)
+```
+
+```{r}
+## model resiudallerinden outlier çıkarma
+
+model3 <- lm(log(price) ~ series + model_year + mileage + 
+                  horsepower + risk_score, 
+                data = trainsetrem)
+summary(model3)
+```
+
+```{r, fig.width=20, fig.height=10, echo=FALSE}
+par(mfrow = c(2, 2))
+plot(model3)
+```
+
+```{r}
+bptest(model3)
+dwtest(model3)
+```
+```{r}
+res = residuals(model3)
+n <- length(res)
+plot(tail(res,n-1) ~ head(res,n-1),xlab = expression(hat(epsilon)[i]),
+     ylab = expression(hat(epsilon)[i + 1]))
+abline(h = 0, v= 0,col=grey(0.75))
+```
+
+```{r}
+cor(tail(res,n-1) , head(res,n-1))
+```
+
+```{r}
+predictionModel3 = predict(model3,testset)
+predictionModel3 = exp(predictionModel3)
+
+results_df <- data.frame(
+  Model = c("predictionModel3"),
+  R2  = c(
+    R2(predictionModel3, testset$price)
+  ),
+  MAE   = c(
+    MAE(predictionModel3, testset$price)
+  ),
+  RMSE  = c(
+    RMSE(predictionModel3, testset$price)
+  ),
+  MAPE  = c(
+    mean(abs((testset$price - predictionModel3) / testset$price)) * 100
+  )
+)
+results_df
+```
+
+
+### Karşılatırmalı Grafik
+```{r}
+results_df <- data.frame(
+  Model = c("predictionModel3", "predictionModel2"),
+  R2    = c(
+    R2(predictionModel3, testset$price),
+    R2(predictionModel2, testset$price)
+  ),
+  MAE   = c(
+    MAE(predictionModel3, testset$price),
+    MAE(predictionModel2, testset$price)
+  ),
+  RMSE  = c(
+    RMSE(predictionModel3, testset$price),
+    RMSE(predictionModel2, testset$price)
+  ),
+  MAPE  = c(
+    mean(abs((testset$price - predictionModel3) / testset$price)) * 100,
+    mean(abs((testset$price - predictionModel2) / testset$price)) * 100
+  )
+)
+results_df
+```
+
+### 4. Final Model Seçimi
+
+Grafiklerde model varsayımlarımda problem görünmüyor fakat Breusch-Pagan test sağlanmamaktadır. Başka testlere bakılabilir. Ayrıca model2 MAPE ve MAE dışında diğer iki skorda öndedir. model2'nin R2 ve RMSE'si daha iyidir. Varsayım sağlamlığından dolayı model2 yi tercih ediyoruz.
+
+Modeli scale edip baktıp fakat skorlarda fark yoktu. Final modelimiz model2'dir.
+
+## Gerçek veri setinden tahmin örneği
+
+Burada gerçek modelin tahmin performansı grafikleri ve varsayım testlerini görüyoruz modelimiz görmediği
+arabayı yaklaşık 100 bin TL farkla tahmin etti. Fakat bu lineer model bazı varsayımları sağlamıyor 
+grafikler iyi olsa bile bu yüzden genel sunum verisi bu veriden üretilmiş sentetik veriydi.
+Bu bölüm ekstra gerçek fiyatlarla kurulmuş modelin tahmin performansını göstermek için yazıldı.
+
+```{r}
+data_clean <- read.csv("data_clean_seri.csv")
+data_clean$series <- as.factor(data_clean$series)
+set.seed(301)
+imputed = mice(data_clean, method = "rf", printFlag = FALSE, m = 3)
+data_Imp = complete(imputed,3)
+set.seed(301)
+sampleIndex <- sample(1:nrow(data_Imp),size = 0.8 * nrow(data_Imp))
+trainset <- data_Imp[sampleIndex,]
+testset <- data_Imp[-sampleIndex,]
+model <- lm(log(price) ~ series + year + 
+              kilometer + 
+              hp + damaged + risk_score, 
+            data = trainset)
+standardized_residuals = rstandard(model)
+olcut1Index = which(abs(standardized_residuals)>2)
+dist = cooks.distance(model)
+olcut1 = mean(dist)*3
+olcut2 = 4/length(dist)
+olcut1Index = which(dist>olcut1)
+olcut2Index = which(dist>olcut2)
+outliers = which(dist>olcut2 & abs(standardized_residuals)>2)
+trainsetrem = trainset[-outliers,]
+train_means <- apply(trainsetrem[,c(-1,-5,-7)], 2, mean)
+train_sds   <- apply(trainsetrem[,c(-1,-5,-7)], 2, sd)
+train_scaled <- trainsetrem
+test_scaled <- testset
+train_scaled[,c(-1,-5,-7)] <- scale(trainsetrem[,c(-1,-5,-7)], center = train_means, scale = train_sds)
+test_scaled[,c(-1,-5,-7)]  <- scale(testset[,c(-1,-5,-7)],  center = train_means, scale = train_sds)
+modelx <- lm(log(price) ~ series + year + 
+               kilometer + 
+               hp + damaged + risk_score, 
+             data = train_scaled)
+```
+
+```{r}
+summary(modelx)
+```
+```{r, fig.width=20, fig.height=10, echo=FALSE}
+par(mfrow = c(2, 2))
+plot(modelx)
+```
+```{r}
+bptest(modelx)
+dwtest(modelx)
+```
+
+```{r}
+res = residuals(modelx)
+n <- length(res)
+plot(tail(res,n-1) ~ head(res,n-1),xlab = expression(hat(epsilon)[i]),
+     ylab = expression(hat(epsilon)[i + 1]))
+abline(h = 0, v= 0,col=grey(0.75))
+```
+
+```{r}
+cor(tail(res,n-1) , head(res,n-1))
+```
+
+Gerçek internetten alınmış ilan verisinden tahmin.
+
+```{r}
+carBMW <- data.frame(series = "3 Serisi", year = 2016, kilometer = 197000, hp = 190, risk_score = 86,damaged = 1, price = 1495000)
+carBMW[,c(-1,-6,-7)]  <- scale(carBMW[,c(-1,-6,-7)],  center = train_means, scale = train_sds)
+predOne = predict(modelx,carBMW)
+predOne = exp(predOne)
+cat("Gerçek Fiyat:",1495000,"\nTahmin Edilmiş Fiyat:",predOne)
+
+# https://www.sahibinden.com/ilan/vasita-otomobil-bmw-gunaydin-garajdan-1285567182/detay
+```
+
+Gerçek veriden eğitilmiş model için test skorları aşağıdaki gibidir.
+
+```{r}
+predictionModelX = predict(modelx,test_scaled)
+predictionModelX = exp(predictionModelX)
+
+results_df <- data.frame(
+  Model = c("predictionModelX"),
+  R2    = c(
+    R2(predictionModelX, test_scaled$price)
+  ),
+  MAE   = c(
+    MAE(predictionModelX, test_scaled$price)
+  ),
+  RMSE  = c(
+    RMSE(predictionModelX, test_scaled$price)
+  ),
+  MAPE  = c(
+    mean(abs((testset$price - predictionModelX) / testset$price)) * 100
+  )
+)
+results_df
+```
+Gerçek fiyat ve tahmin edilmiş fiyat grafiği. Bazı gözlemlerimiz görüldüğü üzere aykırı değer ve RMSE'yi aşırı yükseltiyor.
+
+```{r,echo=FALSE, dev="cairo_pdf"}
+# 1. Grafik penceresini ve kenar boşluklarını ayarla 
+# c(alt, sol, üst, sağ) - Sol boşluğu (5'ten 6'ya) artırdık
+par(mar = c(5, 6, 4, 2)) 
+
+plot(testset$price, predictionModelX,
+     main = "Model Tahmin Başarısı",
+     xlab = "Gerçek Fiyat (Actual Price)",
+     ylab = "", # Y etiketini boş bırakıp 'mtext' ile ekleyeceğiz ki iç içe girmesin
+     pch = 16, 
+     col = rgb(0, 0, 0.5, 0.3),
+     cex = 0.7,         # Noktaları biraz daha küçülttük
+     las = 1,           # Sayıları dik değil düz yaz
+     bty = "n",
+     xaxt = "n",        # Eksenleri manuel düzenlemek için kapattık
+     yaxt = "n")
+
+# 2. Eksenleri ve rakamları daha temiz ekle
+axis(1, at = seq(0, 6e6, by = 2e6), labels = c("0", "2M", "4M", "6M"))
+axis(2, at = seq(0, 8e6, by = 2e6), labels = c("0", "2M", "4M", "6M", "8M"), las = 1)
+
+# 3. Y ekseni başlığını biraz daha sola kaydırarak ekle
+mtext("Tahmin Edilen Fiyat (Predicted Price)", side = 2, line = 4)
+
+# 4. Referans Çizgisi ve Izgara
+grid(nx = NULL, ny = NULL, col = "gray90", lty = "solid")
+abline(a = 0, b = 1, col = "firebrick", lwd = 2.5, lty = 2)
+
+# 5. Lejantı yazıların üzerine binmeyecek bir yere koy
+legend("topleft", legend = c("Tahminler", "İdeal (y = x)"),
+       col = c(rgb(0, 0, 0.5, 0.5), "firebrick"), 
+       pch = c(16, NA), lty = c(NA, 2), bty = "n", cex = 0.8)
+```
+
+Her ne kadar belirlediğimiz influencial gözlemleri çıkarmış da olsak orada elediğimiz verilerden sonra modelimizin leverageleri daha kötü oldu. Bu yüzden o modelimizi buraya koymadık ve herhangi bir ek varsayımı sağlatamadık. Burada yapılabilecek şey farklı en küçük kareler (OLS) regresyon dışındaki daha farklı yöntemlere geçmektir. Ridge, Lasso, Elastic Net gibi cezalandırma yöntemlerinin bulunduğu ve açıklanabilirliğin hala olduğu regresyon yöntemleri veya daha esnek yöntemlere geçmek modelimizin performansı ve geçerli olması için önemli bir adım olacaktır. Burada residual dağılımındaki özellikle çizgideki U-şekilli yapı lineer olmayan değişkenlere işaret olabilir. Bu durum doğrusal regresyon varsayımlarını ihlal eder ve bu noktada polinom terimler ya da daha az açıklanabilir olan Random Forest, Gradient Boosting ya da Gradient Boosting Decision Trees (LightGBM, XGBoost, CatBoost gibi) modellere geçilmesidir. Bu veriyi şuan en iyi tahmin eden model bu yazı dışında geliştirilmiş ve eğitilmiş olan CatBoost modelidir.
